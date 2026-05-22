@@ -1,0 +1,15 @@
+extends:
+  template: templates/run-tests.yaml
+  parameters:
+    environment: rc
+
+schedules:
+  - cron: "0 7 * * 1-5" # 08:00 AM London time (UTC+1)
+    displayName: "Ding Tests - RC"
+    branches:
+      include:
+        - main
+    always: true
+
+trigger: none
+pr: none

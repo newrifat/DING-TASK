@@ -1,0 +1,157 @@
+# templates/run-tests.yaml
+parameters:
+  - name: environment
+    type: string
+    default: rc
+    values:
+      - dev
+      - rc
+      - prod
+  # Optional parameter to override the auth state path from callers.
+  - name: authStatePath
+    type: string
+    default: $(Build.SourcesDirectory)/auth-state.json
+  # Allow callers to control the test filter (optional)
+  - name: testFilter
+    type: string
+    default: 'Type=DINGIntegration'
+  # Allow callers to toggle preloading secure file (optional)
+  - name: preloadAuthState
+    type: boolean
+    default: true
+
+stages:
+- stage: DINGUITests_${{ parameters.environment }}
+  displayName: "Run DING UI Tests in ${{ parameters.environment }}"
+  jobs:
+  - job: Run_DINGTests
+    displayName: "Execute .NET Playwright Tests"
+    timeoutInMinutes: 60
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    variables:
+      # Map the correct variable group per environment (contains BASE_URL + secrets)
+      - ${{ if eq(parameters.environment, 'dev') }}:
+        - group: ding-api-dev
+      - ${{ if eq(parameters.environment, 'rc') }}:
+        - group: ding-api-rc
+      - ${{ if eq(parameters.environment, 'prod') }}:
+        - group: ding-api-prod
+
+      # CI flag to enable longer timeouts and tracing in helpers
+      - name: CI
+        value: 'true'
+
+    steps:
+      - task: UseDotNet@2
+        displayName: "Install .NET 9.0 SDK"
+        inputs:
+          packageType: 'sdk'
+          version: '9.0.x'
+
+      - task: DotNetCoreCLI@2
+        displayName: "Restore NuGet Packages"
+        inputs:
+          command: 'restore'
+          projects: '**/*.sln'
+
+      - task: DotNetCoreCLI@2
+        displayName: "Build Test Project"
+        inputs:
+          command: 'build'
+          projects: '**/*.sln'
+          arguments: '--configuration Release --no-restore'
+
+      # Install Playwright browsers & Linux dependencies using the generated script from the built test project
+      - task: PowerShell@2
+        displayName: 'Install Playwright Browsers'
+        inputs:
+          targetType: 'inline'
+          script: |
+            cd $(Build.SourcesDirectory)
+            pwsh bin/Release/net9.0/playwright.ps1 install --with-deps
+
+      # Node tasks are optional if your solution actually needs npm (retained for parity)
+      - task: NodeTool@0
+        displayName: 'Install Node.js'
+        inputs:
+          versionSpec: '18.x'
+
+      - task: Npm@1
+        displayName: "Install npm dependencies"
+        inputs:
+          command: "install"
+          workingDir: $(Build.SourcesDirectory)
+
+      # # ------------------------------------------------------------
+
+      - task: DotNetCoreCLI@2
+        displayName: "Run Playwright Tests"
+        inputs:
+          command: 'test'
+          projects: '**/*.sln'
+          arguments: >
+            --configuration Release
+            --no-build
+            --filter "${{ parameters.testFilter }}"
+            --logger "console;verbosity=detailed"
+          
+        env:
+          # Headless in CI
+          SHOW_BROWSER: false
+          # Enable CI-aware timeouts in code
+          CI: $(CI)
+
+          # Tenant & secrets (from variable group)
+          BASE_URL: $(BASE_URL)
+          AUTOMATION_USER_NAME: $(AUTOMATION_USER_NAME)
+          ADMIN_CLIENTID: $(ADMIN_CLIENTID)
+
+          # 👇 REQUIRED: Tell the tests where to load/save Playwright storage state
+          AUTH_STATE_PATH: $(Build.SourcesDirectory)/auth-state.json   # e.g. ${{ parameters.authStatePath }}  # e.g. $(Build.SourcesDirectory)/auth-state.json
+
+        continueOnError: true
+        timeoutInMinutes: 120
+        retryCountOnTaskFailure: 2
+
+      # ------------------------------------------------------------
+      # Publish evidence (trace, screenshots) and test artifacts
+      # ------------------------------------------------------------
+      - task: PowerShell@2
+        displayName: 'Collect Test Evidence (trace, screenshots)'
+        condition: succeededOrFailed()
+        inputs:
+          targetType: 'inline'
+          script: |
+            $dest = "$(Build.SourcesDirectory)/TestEvidence"
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+            Get-ChildItem -Path "$(Build.SourcesDirectory)" -Recurse -Include *.png,*.jpg,*.zip,*trace* -ErrorAction SilentlyContinue | `
+              Copy-Item -Destination $dest -Force -ErrorAction SilentlyContinue
+
+            if (Test-Path "$(Build.SourcesDirectory)/TestResults") {
+              Copy-Item -Recurse -Force "$(Build.SourcesDirectory)/TestResults" $dest -ErrorAction SilentlyContinue
+            }
+            if (Test-Path "$(Build.SourcesDirectory)/TestReports") {
+              Copy-Item -Recurse -Force "$(Build.SourcesDirectory)/TestReports" $dest -ErrorAction SilentlyContinue
+            }
+
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(Build.SourcesDirectory)/TestEvidence'
+          artifact: 'test-evidence-${{ parameters.environment }}'
+          publishLocation: 'pipeline'
+        condition: succeededOrFailed()
+        continueOnError: true
+        displayName: 'Publish Test Evidence (traces, screenshots)'
+
+      - task: PublishTestResults@2
+        displayName: 'Publish xUnit TRX Results'
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: VSTest
+          testResultsFiles: '$(Agent.TempDirectory)/*.trx'
+          searchFolder: '$(Agent.TempDirectory)'
+          mergeTestResults: false
+          testRunTitle: 'Playwright xUnit Results - ${{ parameters.environment }}'
